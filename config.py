@@ -31,6 +31,11 @@ class Config:
     digest_threshold: int       # 0 = fall back to default_threshold
     digest_days: int            # 0 = fall back to default_days
 
+    # Only this Discord user ID can confirm destructive prunes (0 = disabled).
+    # Anyone with Manage Server can *run* /prune_inactive to see previews,
+    # but only this user can click the confirm button that actually kicks people.
+    authorized_pruner_id: int
+
     # How many days of history to keep. Older rows are periodically purged.
     retention_days: int
 
@@ -56,6 +61,7 @@ class Config:
             digest_hour_utc=min(23, max(0, _int("DIGEST_HOUR_UTC", 14))),
             digest_threshold=_int("DIGEST_THRESHOLD", 0),
             digest_days=_int("DIGEST_DAYS", 0),
+            authorized_pruner_id=_int("AUTHORIZED_PRUNER_ID", 0),
             retention_days=_int("RETENTION_DAYS", 365),
             backfill_batch_size=_int("BACKFILL_BATCH_SIZE", 500),
             db_path=os.getenv("DB_PATH", "activity.db"),
