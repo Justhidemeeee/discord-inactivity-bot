@@ -33,7 +33,7 @@ class Config:
 
     # Only this Discord user ID can confirm destructive prunes (0 = disabled).
     # Anyone with Manage Server can *run* /prune_inactive to see previews,
-    # but only this user can click the confirm button that actually kicks people.
+    # but the kick button is only attached when this user runs it.
     authorized_pruner_id: int
 
     # How many days of history to keep. Older rows are periodically purged.
@@ -41,6 +41,7 @@ class Config:
 
     # Backfill knobs.
     backfill_batch_size: int    # rows to flush per SQLite transaction
+    backfill_concurrency: int   # channels scanned in parallel
 
     db_path: str
 
@@ -63,6 +64,7 @@ class Config:
             digest_days=_int("DIGEST_DAYS", 0),
             authorized_pruner_id=_int("AUTHORIZED_PRUNER_ID", 0),
             retention_days=_int("RETENTION_DAYS", 365),
-            backfill_batch_size=_int("BACKFILL_BATCH_SIZE", 500),
+            backfill_batch_size=max(1, _int("BACKFILL_BATCH_SIZE", 500)),
+            backfill_concurrency=min(10, max(1, _int("BACKFILL_CONCURRENCY", 3))),
             db_path=os.getenv("DB_PATH", "activity.db"),
         )

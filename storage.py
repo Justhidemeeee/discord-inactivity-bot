@@ -27,6 +27,21 @@ from typing import Iterable, Optional
 
 log = logging.getLogger(__name__)
 
+_UPSERT_ACTIVITY = """
+    INSERT INTO activity (user_id, channel_id, day, count)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id, channel_id, day) DO UPDATE SET count = count + excluded.count
+"""
+
+
+def iso_utc(ts: dt.datetime) -> str:
+    """Fixed-width UTC timestamp, so stored values compare correctly as strings."""
+    return ts.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def parse_iso_utc(value: str) -> dt.datetime:
+    return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=dt.timezone.utc)
+
 
 class Storage:
     def __init__(self, path: Path):
@@ -42,6 +57,11 @@ class Storage:
 
     def _migrate(self) -> None:
         with self._locked() as cur:
+            # WAL + NORMAL: writes no longer fsync on every commit, and readers
+            # don't block the writer. Safe against app crashes; worst case on
+            # power loss is losing the last few commits.
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
             cur.executescript("""
                 CREATE TABLE IF NOT EXISTS activity (
                     user_id     INTEGER NOT NULL,
@@ -50,15 +70,18 @@ class Storage:
                     count       INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (user_id, channel_id, day)
                 );
-                CREATE INDEX IF NOT EXISTS idx_activity_day        ON activity(day);
-                CREATE INDEX IF NOT EXISTS idx_activity_user_day   ON activity(user_id, day);
+                -- Covering index: the /inactive query is answered from the index alone.
+                DROP INDEX IF EXISTS idx_activity_day;
+                CREATE INDEX IF NOT EXISTS idx_activity_day_user ON activity(day, user_id, count);
+                CREATE INDEX IF NOT EXISTS idx_activity_user_day ON activity(user_id, day);
 
                 CREATE TABLE IF NOT EXISTS backfill_progress (
                     channel_id       INTEGER PRIMARY KEY,
                     last_message_id  INTEGER,       -- most recent message we ingested
                     oldest_reached   INTEGER,       -- oldest message id we've walked back to
                     complete         INTEGER NOT NULL DEFAULT 0,
-                    updated_at       TEXT
+                    updated_at       TEXT,
+                    covered_since    TEXT           -- every message at/after this time is counted
                 );
 
                 CREATE TABLE IF NOT EXISTS meta (
@@ -66,6 +89,9 @@ class Storage:
                     value TEXT
                 );
             """)
+            cur.execute("PRAGMA table_info(backfill_progress)")
+            if "covered_since" not in {row[1] for row in cur.fetchall()}:
+                cur.execute("ALTER TABLE backfill_progress ADD COLUMN covered_since TEXT")
 
     @contextmanager
     def _locked(self):
@@ -76,30 +102,54 @@ class Storage:
             finally:
                 cur.close()
 
+    @contextmanager
+    def _transaction(self):
+        with self._locked() as cur:
+            cur.execute("BEGIN")
+            try:
+                yield cur
+            except BaseException:
+                cur.execute("ROLLBACK")
+                raise
+            cur.execute("COMMIT")
+
     # -- writes --------------------------------------------------------------------
 
-    def bump(self, *, user_id: int, channel_id: int, day: str, delta: int = 1) -> None:
-        """Increment the counter for one (user, channel, day) tuple. Used by live capture."""
-        with self._locked() as cur:
-            cur.execute("""
-                INSERT INTO activity (user_id, channel_id, day, count)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id, channel_id, day) DO UPDATE SET count = count + excluded.count
-            """, (user_id, channel_id, day, delta))
-
     def bulk_bump(self, rows: Iterable[tuple[int, int, str, int]]) -> None:
-        """Batch upsert (user_id, channel_id, day, count) tuples. Used by backfill."""
+        """Batch upsert (user_id, channel_id, day, count) tuples."""
         rows = list(rows)
         if not rows:
             return
-        with self._locked() as cur:
-            cur.execute("BEGIN")
-            cur.executemany("""
-                INSERT INTO activity (user_id, channel_id, day, count)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id, channel_id, day) DO UPDATE SET count = count + excluded.count
-            """, rows)
-            cur.execute("COMMIT")
+        with self._transaction() as cur:
+            cur.executemany(_UPSERT_ACTIVITY, rows)
+
+    def flush_backfill(self, rows: list[tuple[int, int, str, int]], *, channel_id: int,
+                       last_message_id: Optional[int], oldest_reached: Optional[int],
+                       complete: bool, covered_since: Optional[str] = None) -> None:
+        """Write a backfill batch and its checkpoint in one transaction.
+
+        Doing both atomically means a crash can never count a batch without
+        also recording that it was counted (which would double-count on resume).
+        """
+        with self._transaction() as cur:
+            if rows:
+                cur.executemany(_UPSERT_ACTIVITY, rows)
+            cur.execute("""
+                INSERT INTO backfill_progress
+                    (channel_id, last_message_id, oldest_reached, complete, updated_at, covered_since)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    last_message_id = COALESCE(backfill_progress.last_message_id, excluded.last_message_id),
+                    oldest_reached  = COALESCE(excluded.oldest_reached, backfill_progress.oldest_reached),
+                    complete        = excluded.complete,
+                    updated_at      = excluded.updated_at,
+                    covered_since   = CASE
+                        WHEN backfill_progress.covered_since IS NULL THEN excluded.covered_since
+                        WHEN excluded.covered_since IS NULL THEN backfill_progress.covered_since
+                        ELSE MIN(backfill_progress.covered_since, excluded.covered_since)
+                    END
+            """, (channel_id, last_message_id, oldest_reached, 1 if complete else 0,
+                  iso_utc(dt.datetime.now(dt.timezone.utc)), covered_since))
 
     # -- queries -------------------------------------------------------------------
 
@@ -112,7 +162,7 @@ class Storage:
                 WHERE day >= ?
                 GROUP BY user_id
             """, (cutoff_day,))
-            return {row[0]: row[1] for row in cur.fetchall()}
+            return dict(cur.fetchall())
 
     def per_user_stats(self, user_id: int, cutoff_day: str) -> dict:
         """Detailed stats for one user: total, last_day_seen, top channel."""
@@ -138,32 +188,16 @@ class Storage:
 
     # -- backfill bookkeeping ------------------------------------------------------
 
-    def get_progress(self, channel_id: int) -> Optional[tuple[int, int, bool]]:
-        """Return (last_message_id, oldest_reached, complete) or None."""
+    def get_progress(self, channel_id: int) -> Optional[dict]:
         with self._locked() as cur:
             cur.execute("""
-                SELECT last_message_id, oldest_reached, complete
+                SELECT oldest_reached, complete, covered_since
                 FROM backfill_progress WHERE channel_id = ?
             """, (channel_id,))
             row = cur.fetchone()
         if not row:
             return None
-        return (row[0] or 0, row[1] or 0, bool(row[2]))
-
-    def save_progress(self, *, channel_id: int, last_message_id: Optional[int],
-                      oldest_reached: Optional[int], complete: bool) -> None:
-        with self._locked() as cur:
-            cur.execute("""
-                INSERT INTO backfill_progress
-                    (channel_id, last_message_id, oldest_reached, complete, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(channel_id) DO UPDATE SET
-                    last_message_id = COALESCE(excluded.last_message_id, backfill_progress.last_message_id),
-                    oldest_reached  = COALESCE(excluded.oldest_reached,  backfill_progress.oldest_reached),
-                    complete        = excluded.complete,
-                    updated_at      = excluded.updated_at
-            """, (channel_id, last_message_id, oldest_reached, 1 if complete else 0,
-                  dt.datetime.now(dt.timezone.utc).isoformat()))
+        return {"oldest_reached": row[0], "complete": bool(row[1]), "covered_since": row[2]}
 
     def all_progress(self) -> list[dict]:
         with self._locked() as cur:
@@ -202,3 +236,10 @@ class Storage:
                 INSERT INTO meta (key, value) VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """, (key, value))
+
+    def meta_setdefault(self, key: str, value: str) -> str:
+        """Set key only if absent; return the stored value either way."""
+        with self._locked() as cur:
+            cur.execute("INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)", (key, value))
+            cur.execute("SELECT value FROM meta WHERE key = ?", (key,))
+            return cur.fetchone()[0]
