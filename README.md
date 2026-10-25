@@ -21,6 +21,9 @@ All commands are mod-only (require Manage Server permission).
 - **`/prune_inactive [threshold] [days] [only_role] [exclude_role] [min_join_age_days] [dry_run]`**
   Previews who would be kicked. With `dry_run:false`, run by the user in `AUTHORIZED_PRUNER_ID`, it adds a two-click kick button. Activity is re-checked at confirm time, so anyone who posted since the preview is spared. Kicks are logged to the digest channel if one is set.
 
+- **`/sitehealth`** (anyone can use it)
+  Checks deltachud.wiki the same way the uptime monitor does: `/healthz` (database-backed), the homepage, then the site-status API. Replies UP, MAINTENANCE or DOWN with the reason and response times. 20-second cooldown per channel. Point it elsewhere with `SITE_HEALTH_URL`.
+
 ## Monthly digest
 
 If you set `DIGEST_CHANNEL_ID` in the env, the bot auto-posts an inactivity report to that channel once a month at your configured day/hour:

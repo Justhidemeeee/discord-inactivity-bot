@@ -43,6 +43,8 @@ class Config:
     backfill_batch_size: int    # rows to flush per SQLite transaction
     backfill_concurrency: int   # channels scanned in parallel
 
+    site_health_url: str        # base URL checked by /sitehealth
+
     db_path: str        # SQLite file, used when database_url is empty
     database_url: str   # Postgres URL (Heroku sets DATABASE_URL automatically)
 
@@ -67,6 +69,7 @@ class Config:
             retention_days=_int("RETENTION_DAYS", 365),
             backfill_batch_size=max(1, _int("BACKFILL_BATCH_SIZE", 500)),
             backfill_concurrency=min(10, max(1, _int("BACKFILL_CONCURRENCY", 3))),
+            site_health_url=os.getenv("SITE_HEALTH_URL", "https://deltachud.wiki"),
             db_path=os.getenv("DB_PATH", "activity.db"),
             database_url=os.getenv("DATABASE_URL", ""),
         )

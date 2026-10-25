@@ -26,6 +26,7 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
+import sitehealth
 from config import Config
 from storage import Storage, iso_utc, parse_iso_utc
 
@@ -564,6 +565,46 @@ class InactivityBot(discord.Client):
                 await interaction.followup.send(f"❌ Digest failed: {e}", ephemeral=True)
                 return
             await interaction.followup.send(f"✅ Digest posted to {channel.mention}.", ephemeral=True)
+
+        @self.tree.command(name="sitehealth",
+                           description="Check whether the wiki is up right now.")
+        # Per-channel cooldown so the command can't be used to hammer the site.
+        @app_commands.checks.cooldown(1, 20.0, key=lambda i: i.channel_id)
+        async def sitehealth_cmd(interaction: discord.Interaction):
+            await interaction.response.defer(thinking=True)
+            report = await sitehealth.probe(self.config.site_health_url)
+            color, icon = {
+                sitehealth.UP: (discord.Color.green(), "🟢"),
+                sitehealth.MAINTENANCE: (discord.Color.gold(), "🟡"),
+                sitehealth.DOWN: (discord.Color.red(), "🔴"),
+            }[report.state]
+            embed = discord.Embed(
+                title=f"{icon} {self.config.site_health_url.removeprefix('https://')} is {report.state}",
+                description=report.reason,
+                color=color,
+                timestamp=dt.datetime.now(dt.timezone.utc),
+            )
+            for c in report.checks:
+                timing = f"{c.ms} ms" if c.ms is not None else "—"
+                embed.add_field(name=f"{'✅' if c.ok else '❌'} {c.path}",
+                                value=f"{c.detail} · {timing}", inline=False)
+            await interaction.followup.send(embed=embed,
+                                            allowed_mentions=discord.AllowedMentions.none())
+
+        @self.tree.error
+        async def on_tree_error(interaction: discord.Interaction,
+                                error: app_commands.AppCommandError):
+            if isinstance(error, app_commands.CommandOnCooldown):
+                msg = f"⏳ Slow down — try again in {error.retry_after:.0f} s."
+            else:
+                log.exception("Command %s failed",
+                              interaction.command.name if interaction.command else "?",
+                              exc_info=error)
+                msg = "❌ Something went wrong running that command."
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
 
         @self.tree.command(name="backfill",
                            description="Walk channel history to seed the DB. Safe to re-run — it resumes.")
