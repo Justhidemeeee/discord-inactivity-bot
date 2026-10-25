@@ -61,9 +61,9 @@ The scheduler checks hourly and posts once per calendar month, at or after the c
 
 Enable Developer Mode (User Settings → Advanced), then right-click your server icon → Copy Server ID.
 
-### 3. Deploy on Railway
+### 3. Deploy on Railway (SQLite on a volume)
 
-1. Push this folder to a GitHub repo (make sure `.env` is gitignored)
+1. Push this folder to a GitHub repo (`.env` is already gitignored)
 2. New Railway project → Deploy from repo
 3. **Add a Volume** (Settings tab → Volumes → New Volume → mount path `/data`). This is **required** or your DB gets wiped on every redeploy.
 4. Variables tab → Raw Editor:
@@ -79,6 +79,23 @@ Enable Developer Mode (User Settings → Advanced), then right-click your server
    AUTHORIZED_PRUNER_ID=your-user-id
    ```
 5. Deploy. Watch logs for `Logged in as ...`.
+
+### 3b. Or deploy on Heroku
+
+Heroku wipes the dyno filesystem on every restart, so the bot uses Postgres there. It switches to Postgres automatically whenever `DATABASE_URL` is set, which Heroku Postgres does for you.
+
+```
+heroku create your-app-name
+heroku addons:create heroku-postgresql:essential-0 -a your-app-name
+heroku config:set -a your-app-name DISCORD_TOKEN=your-token GUILD_ID=your-server-id \
+    DEFAULT_THRESHOLD=10 DEFAULT_DAYS=60 RETENTION_DAYS=365 AUTHORIZED_PRUNER_ID=your-user-id
+git push https://git.heroku.com/your-app-name.git HEAD:main
+heroku ps:scale worker=1 -a your-app-name
+```
+
+The `Procfile` runs the bot as a `worker` dyno (no web process — it doesn't serve HTTP). Tables are created on startup. Watch `heroku logs --tail -a your-app-name` for `Logged in as ...`.
+
+Only run **one** instance per bot token — two dynos (or two apps) on the same token will answer every command twice.
 
 ### 4. Seed the DB
 

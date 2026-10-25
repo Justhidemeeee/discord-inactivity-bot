@@ -1,4 +1,7 @@
-"""SQLite-backed message activity store.
+"""Message activity store — SQLite locally / on Railway, Postgres on Heroku.
+
+If DATABASE_URL is set (Heroku Postgres sets it automatically) we use Postgres,
+because Heroku's filesystem is wiped on every dyno restart. Otherwise SQLite.
 
 Schema is a rolled-up daily fact table — one row per (user, channel, day)
 counting messages. This keeps the DB small (thousands of rows even for busy
@@ -13,6 +16,9 @@ servers) and makes arbitrary window queries fast:
 We also track backfill progress per channel so /backfill is resumable — if
 Railway restarts mid-scan, we pick up from where we left off instead of
 re-processing thousands of messages.
+
+All SQL is written once with `?` placeholders and portable syntax; the
+Postgres cursor wrapper translates placeholders.
 """
 
 from __future__ import annotations
@@ -30,8 +36,54 @@ log = logging.getLogger(__name__)
 _UPSERT_ACTIVITY = """
     INSERT INTO activity (user_id, channel_id, day, count)
     VALUES (?, ?, ?, ?)
-    ON CONFLICT(user_id, channel_id, day) DO UPDATE SET count = count + excluded.count
+    ON CONFLICT(user_id, channel_id, day) DO UPDATE SET count = activity.count + excluded.count
 """
+
+# Discord snowflakes don't fit in 32 bits, so Postgres needs BIGINT. (SQLite's
+# INTEGER is already 64-bit.) count stays INTEGER so SUM(count) returns an int.
+_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS activity (
+        user_id     {big} NOT NULL,
+        channel_id  {big} NOT NULL,
+        day         TEXT    NOT NULL,   -- ISO date YYYY-MM-DD (UTC)
+        count       INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, channel_id, day)
+    );
+    -- Covering index: the /inactive query is answered from the index alone.
+    DROP INDEX IF EXISTS idx_activity_day;
+    CREATE INDEX IF NOT EXISTS idx_activity_day_user ON activity(day, user_id, count);
+    CREATE INDEX IF NOT EXISTS idx_activity_user_day ON activity(user_id, day);
+
+    CREATE TABLE IF NOT EXISTS backfill_progress (
+        channel_id       {big} PRIMARY KEY,
+        last_message_id  {big},         -- most recent message we ingested
+        oldest_reached   {big},         -- oldest message id we've walked back to
+        complete         INTEGER NOT NULL DEFAULT 0,
+        updated_at       TEXT,
+        covered_since    TEXT           -- every message at/after this time is counted
+    );
+
+    CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT
+    );
+"""
+
+
+class _PgCursor:
+    """Lets the shared `?`-style SQL run on a psycopg cursor."""
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql: str, params=None):
+        return self._cur.execute(sql.replace("?", "%s"), params)
+
+    def executemany(self, sql: str, rows):
+        return self._cur.executemany(sql.replace("?", "%s"), rows)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
 
 
 def iso_utc(ts: dt.datetime) -> str:
@@ -44,51 +96,42 @@ def parse_iso_utc(value: str) -> dt.datetime:
 
 
 class Storage:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, database_url: str = ""):
         self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # sqlite3 connections are thread-affine — we open one and guard it
-        # with a lock, which is fine for our low-contention workload.
-        self._conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
+        self.database_url = database_url
+        self.is_postgres = bool(database_url)
+        # One connection guarded by a lock is plenty for our low-contention workload.
         self._lock = threading.Lock()
+        self._conn = self._connect()
         self._migrate()
+
+    def _connect(self):
+        if self.is_postgres:
+            import psycopg  # only needed on Postgres deployments
+            return psycopg.connect(self.database_url, autocommit=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        return sqlite3.connect(str(self.path), check_same_thread=False, isolation_level=None)
+
+    @property
+    def description(self) -> str:
+        return "Postgres (DATABASE_URL)" if self.is_postgres else str(self.path)
 
     # -- schema --------------------------------------------------------------------
 
     def _migrate(self) -> None:
+        if self.is_postgres:
+            with self._transaction() as cur:
+                for stmt in _SCHEMA.format(big="BIGINT").split(";"):
+                    if stmt.strip():
+                        cur.execute(stmt)
+            return
         with self._locked() as cur:
             # WAL + NORMAL: writes no longer fsync on every commit, and readers
             # don't block the writer. Safe against app crashes; worst case on
             # power loss is losing the last few commits.
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA synchronous=NORMAL")
-            cur.executescript("""
-                CREATE TABLE IF NOT EXISTS activity (
-                    user_id     INTEGER NOT NULL,
-                    channel_id  INTEGER NOT NULL,
-                    day         TEXT    NOT NULL,   -- ISO date YYYY-MM-DD (UTC)
-                    count       INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (user_id, channel_id, day)
-                );
-                -- Covering index: the /inactive query is answered from the index alone.
-                DROP INDEX IF EXISTS idx_activity_day;
-                CREATE INDEX IF NOT EXISTS idx_activity_day_user ON activity(day, user_id, count);
-                CREATE INDEX IF NOT EXISTS idx_activity_user_day ON activity(user_id, day);
-
-                CREATE TABLE IF NOT EXISTS backfill_progress (
-                    channel_id       INTEGER PRIMARY KEY,
-                    last_message_id  INTEGER,       -- most recent message we ingested
-                    oldest_reached   INTEGER,       -- oldest message id we've walked back to
-                    complete         INTEGER NOT NULL DEFAULT 0,
-                    updated_at       TEXT,
-                    covered_since    TEXT           -- every message at/after this time is counted
-                );
-
-                CREATE TABLE IF NOT EXISTS meta (
-                    key   TEXT PRIMARY KEY,
-                    value TEXT
-                );
-            """)
+            cur.executescript(_SCHEMA.format(big="INTEGER"))
             cur.execute("PRAGMA table_info(backfill_progress)")
             if "covered_since" not in {row[1] for row in cur.fetchall()}:
                 cur.execute("ALTER TABLE backfill_progress ADD COLUMN covered_since TEXT")
@@ -96,9 +139,15 @@ class Storage:
     @contextmanager
     def _locked(self):
         with self._lock:
+            # Hosted Postgres drops idle connections now and then (maintenance,
+            # failover). Reconnect lazily so one dropped connection costs one
+            # failed call instead of a dead bot.
+            if self.is_postgres and (self._conn.closed or self._conn.broken):
+                log.warning("Postgres connection lost — reconnecting")
+                self._conn = self._connect()
             cur = self._conn.cursor()
             try:
-                yield cur
+                yield _PgCursor(cur) if self.is_postgres else cur
             finally:
                 cur.close()
 
@@ -146,7 +195,9 @@ class Storage:
                     covered_since   = CASE
                         WHEN backfill_progress.covered_since IS NULL THEN excluded.covered_since
                         WHEN excluded.covered_since IS NULL THEN backfill_progress.covered_since
-                        ELSE MIN(backfill_progress.covered_since, excluded.covered_since)
+                        WHEN excluded.covered_since < backfill_progress.covered_since
+                            THEN excluded.covered_since
+                        ELSE backfill_progress.covered_since
                     END
             """, (channel_id, last_message_id, oldest_reached, 1 if complete else 0,
                   iso_utc(dt.datetime.now(dt.timezone.utc)), covered_since))
@@ -240,6 +291,7 @@ class Storage:
     def meta_setdefault(self, key: str, value: str) -> str:
         """Set key only if absent; return the stored value either way."""
         with self._locked() as cur:
-            cur.execute("INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)", (key, value))
+            cur.execute("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                        (key, value))
             cur.execute("SELECT value FROM meta WHERE key = ?", (key,))
             return cur.fetchone()[0]

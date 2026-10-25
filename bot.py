@@ -5,9 +5,10 @@ Hybrid design:
   - `/backfill` walks channel history to seed those counters with historical data.
   - `/inactive` queries the counters for anyone below a threshold in a time window.
 
-Storage is SQLite (see storage.py). On Railway make sure to attach a Volume
-mounted at /data and set DB_PATH=/data/activity.db, otherwise the DB is wiped
-on every redeploy and you'd have to re-backfill.
+Storage (see storage.py) is Postgres when DATABASE_URL is set — Heroku sets it
+when you attach Heroku Postgres — and SQLite otherwise. With SQLite on Railway,
+attach a Volume mounted at /data and set DB_PATH=/data/activity.db, otherwise
+the DB is wiped on every redeploy and you'd have to re-backfill.
 """
 
 from __future__ import annotations
@@ -86,7 +87,7 @@ class InactivityBot(discord.Client):
         super().__init__(intents=make_intents())
         self.config = config
         self.tree = app_commands.CommandTree(self)
-        self.storage = Storage(Path(config.db_path))
+        self.storage = Storage(Path(config.db_path), database_url=config.database_url)
         self._backfill_task: Optional[asyncio.Task] = None
         self._shutdown_task: Optional[asyncio.Task] = None
         # Live counts are buffered in memory and flushed every few seconds,
@@ -127,7 +128,7 @@ class InactivityBot(discord.Client):
     async def on_ready(self) -> None:
         total = await asyncio.to_thread(self.storage.total_rows)
         log.info("Logged in as %s — tracking guild %s (DB=%s, %d rows)",
-                 self.user, self.config.guild_id, self.config.db_path, total)
+                 self.user, self.config.guild_id, self.storage.description, total)
 
     # -- live capture ---------------------------------------------------------------
 

@@ -43,7 +43,8 @@ class Config:
     backfill_batch_size: int    # rows to flush per SQLite transaction
     backfill_concurrency: int   # channels scanned in parallel
 
-    db_path: str
+    db_path: str        # SQLite file, used when database_url is empty
+    database_url: str   # Postgres URL (Heroku sets DATABASE_URL automatically)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -67,4 +68,5 @@ class Config:
             backfill_batch_size=max(1, _int("BACKFILL_BATCH_SIZE", 500)),
             backfill_concurrency=min(10, max(1, _int("BACKFILL_CONCURRENCY", 3))),
             db_path=os.getenv("DB_PATH", "activity.db"),
+            database_url=os.getenv("DATABASE_URL", ""),
         )
