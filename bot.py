@@ -591,6 +591,51 @@ class InactivityBot(discord.Client):
             await interaction.followup.send(embed=embed,
                                             allowed_mentions=discord.AllowedMentions.none())
 
+        @self.tree.command(name="vcstatus",
+                           description="Set the status of the voice channel you're in.")
+        @app_commands.describe(text="New status (leave empty to clear it).")
+        @app_commands.guild_only()
+        @app_commands.checks.cooldown(1, 5.0, key=lambda i: i.user.id)
+        async def vcstatus_cmd(interaction: discord.Interaction,
+                               text: Optional[app_commands.Range[str, 1, 500]] = None):
+            member = interaction.user
+            voice = member.voice if isinstance(member, discord.Member) else None
+            channel = voice.channel if voice else None
+            if channel is None:
+                await interaction.response.send_message(
+                    "❌ Join a voice channel first.", ephemeral=True)
+                return
+            if not isinstance(channel, discord.VoiceChannel):
+                await interaction.response.send_message(
+                    "❌ Stage channels don't have a status — only regular voice channels do.",
+                    ephemeral=True)
+                return
+            # Same rule Discord applies when you set it yourself, so the bot
+            # can't be used to get around the server's permissions.
+            if not channel.permissions_for(member).set_voice_channel_status:
+                await interaction.response.send_message(
+                    f"❌ You don't have **Set Voice Channel Status** in {channel.mention}.",
+                    ephemeral=True)
+                return
+            # The bot isn't connected to the channel, so Discord also requires Manage Channels.
+            mine = channel.permissions_for(channel.guild.me)
+            if not (mine.set_voice_channel_status and mine.manage_channels):
+                await interaction.response.send_message(
+                    f"❌ I need **Set Voice Channel Status** and **Manage Channels** in "
+                    f"{channel.mention} to change its status.", ephemeral=True)
+                return
+
+            try:
+                await channel.edit(status=text, reason=f"/vcstatus by {member}")
+            except discord.HTTPException as e:
+                await interaction.response.send_message(
+                    f"❌ Discord rejected the change: {e.text or e.status}", ephemeral=True)
+                return
+            await interaction.response.send_message(
+                f"✅ Status of {channel.mention} set to: {text}" if text
+                else f"✅ Cleared the status of {channel.mention}.",
+                ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
         @self.tree.error
         async def on_tree_error(interaction: discord.Interaction,
                                 error: app_commands.AppCommandError):

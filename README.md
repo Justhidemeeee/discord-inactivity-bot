@@ -24,6 +24,9 @@ All commands are mod-only (require Manage Server permission).
 - **`/sitehealth`** (anyone can use it)
   Checks deltachud.wiki the same way the uptime monitor does: `/healthz` (database-backed), the homepage, then the site-status API. Replies UP, MAINTENANCE or DOWN with the reason and response times. 20-second cooldown per channel. Point it elsewhere with `SITE_HEALTH_URL`.
 
+- **`/vcstatus [text]`** (anyone with Set Voice Channel Status)
+  Sets the status of the voice channel you're currently in. Leave `text` empty to clear it. You need **Set Voice Channel Status** in that channel, the same as setting it yourself; the bot needs **Set Voice Channel Status** and **Manage Channels**. 5-second cooldown per user.
+
 ## Monthly digest
 
 If you set `DIGEST_CHANNEL_ID` in the env, the bot auto-posts an inactivity report to that channel once a month at your configured day/hour:
