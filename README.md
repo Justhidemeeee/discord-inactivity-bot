@@ -8,6 +8,8 @@ All commands are mod-only (require Manage Server permission).
 
 - **`/inactive [threshold] [days] [only_role] [exclude_role] [min_join_age_days]`**
   Main query. Lists members below the threshold in the window. Returns an embed with mentions, message counts, join dates. If >40 matches, attaches a text file with the full list.
+- **`/newmembers [days] [include_bots]`**
+  Lists members who joined in the last `days` days (default 7), newest first, with how long ago they joined and when their account was created. Bots are hidden unless `include_bots` is true. If more than 40 match, the full list is attached as a text file.
 - **`/activity user:@someone [days]`**
   Deep dive on one member — total messages, last active day, most-active channel.
 - **`/backfill [days] [channel]`**

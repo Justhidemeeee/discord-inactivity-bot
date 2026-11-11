@@ -373,6 +373,56 @@ class InactivityBot(discord.Client):
             )
             await interaction.followup.send(embed=embed, files=files, ephemeral=True)
 
+        @self.tree.command(name="newmembers",
+                           description="List members who joined recently (default: last 7 days).")
+        @app_commands.describe(days="How many days back to look (default 7).",
+                               include_bots="Also list bot accounts (default: no).")
+        @app_commands.default_permissions(manage_guild=True)
+        @app_commands.guild_only()
+        async def newmembers_cmd(interaction: discord.Interaction,
+                                 days: Optional[Days] = None,
+                                 include_bots: bool = False):
+            await interaction.response.defer(thinking=True, ephemeral=True)
+            dy = days if days is not None else 7
+            now = dt.datetime.now(dt.timezone.utc)
+            cutoff = now - dt.timedelta(days=dy)
+            recent = sorted(
+                (m for m in interaction.guild.members
+                 if m.joined_at is not None and m.joined_at >= cutoff
+                 and (include_bots or not m.bot)),
+                key=lambda m: m.joined_at, reverse=True)
+
+            embed = discord.Embed(
+                title=f"🆕 New members ({len(recent)})",
+                description=f"Joined in the last **{dy} day{'s' if dy != 1 else ''}**, newest first.",
+                color=discord.Color.green() if recent else discord.Color.light_grey(),
+            )
+            files: list[discord.File] = []
+            if not recent:
+                embed.description += "\n\n_Nobody joined in that window._"
+            else:
+                # <t:..:R> renders as "3 days ago" in each viewer's own timezone.
+                def line(m: discord.Member) -> str:
+                    flags = " 🤖" if m.bot else ""
+                    return (f"• {m.mention}{flags} — joined <t:{int(m.joined_at.timestamp())}:R>"
+                            f" · account made {m.created_at:%Y-%m-%d}")
+                shown, body = [], ""
+                for m in recent[:EMBED_LIST_LIMIT]:
+                    nxt = body + line(m) + "\n"
+                    if len(embed.description) + len(nxt) > 3900:  # embed description cap is 4096
+                        break
+                    body = nxt
+                    shown.append(m)
+                embed.description += "\n\n" + body
+                if len(shown) < len(recent):
+                    lines = [f"# Members who joined in the last {dy}d ({len(recent)})"]
+                    lines += [f"{m} ({m.id})\tjoined {m.joined_at:%Y-%m-%d %H:%M} UTC"
+                              f"\taccount made {m.created_at:%Y-%m-%d}" for m in recent]
+                    files.append(text_file("\n".join(lines) + "\n", "new_members.txt"))
+                    embed.set_footer(text=f"Showing {len(shown)} of {len(recent)} — full list attached.")
+            await interaction.followup.send(embed=embed, files=files, ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
+
         @self.tree.command(name="activity",
                            description="Show recent activity for one member.")
         @app_commands.describe(user="The member to inspect.",
