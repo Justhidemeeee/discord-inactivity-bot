@@ -26,6 +26,7 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
+import namecheck
 import sitehealth
 from config import Config
 from storage import Storage, iso_utc, parse_iso_utc
@@ -130,30 +131,60 @@ class InactivityBot(discord.Client):
         total = await asyncio.to_thread(self.storage.total_rows)
         log.info("Logged in as %s — tracking guild %s (DB=%s, %d rows)",
                  self.user, self.config.guild_id, self.storage.description, total)
-        # Catch nicknames set while the bot was offline.
-        for guild in self.guilds:
-            for uid in self.config.nick_locked_user_ids:
-                member = guild.get_member(uid)
-                if member is not None and member.nick is not None:
-                    await self._clear_nick(member)
+        # Catch names changed while the bot was offline.
+        if self.config.nick_locked_user_ids or self.config.impersonation_terms:
+            for guild in self.guilds:
+                for member in list(guild.members):
+                    await self._enforce_name(member)
 
-    # -- nickname lock --------------------------------------------------------------
+    # -- name rules: nickname lock + impersonation block -----------------------------
 
-    async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
-        if after.id in self.config.nick_locked_user_ids and after.nick is not None \
-                and after.nick != before.nick:
-            await self._clear_nick(after)
+    def _wanted_nick(self, member: discord.Member) -> tuple[bool, Optional[str], str]:
+        """Return (enforce, nick, reason): whether to set the nickname, and to what."""
+        cfg = self.config
+        if member.id == cfg.protected_user_id or member.bot:
+            return False, None, ""
+        forced = cfg.impersonation_nick
+        if cfg.impersonation_terms:
+            # The forced nickname itself doesn't count, or it would never settle.
+            nick = member.nick if member.nick != forced else None
+            if namecheck.impersonates((member.name, member.global_name, nick), cfg.impersonation_terms):
+                return True, forced, "Impersonation block (IMPERSONATION_TERMS)"
+        if member.id in cfg.nick_locked_user_ids:
+            return True, None, "Nickname locked (NICK_LOCKED_USER_IDS)"
+        if cfg.impersonation_terms and member.nick == forced:
+            return True, None, "No longer impersonating"
+        return False, None, ""
 
-    async def _clear_nick(self, member: discord.Member) -> None:
-        nick = member.nick
+    async def _enforce_name(self, member: discord.Member) -> None:
+        enforce, nick, reason = self._wanted_nick(member)
+        if not enforce or member.nick == nick:
+            return
+        old = member.nick
         try:
-            await member.edit(nick=None, reason="Nickname locked (NICK_LOCKED_USER_IDS)")
-            log.info("Cleared nickname %r of %s in %s", nick, member, member.guild.name)
+            await member.edit(nick=nick, reason=reason)
+            log.info("%s: nickname of %s in %s %r -> %r", reason, member, member.guild.name, old, nick)
         except discord.Forbidden:
-            log.warning("Can't clear nickname of %s in %s — the bot's highest role must be "
+            log.warning("Can't change nickname of %s in %s — the bot's highest role must be "
                         "above theirs, with Manage Nicknames", member, member.guild.name)
         except discord.HTTPException as e:
-            log.warning("Clearing nickname of %s failed: %s", member, e)
+            log.warning("Changing nickname of %s failed: %s", member, e)
+
+    async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
+        if before.nick != after.nick:
+            await self._enforce_name(after)
+
+    async def on_user_update(self, before: discord.User, after: discord.User) -> None:
+        # Username / global display name changes arrive here, once per user.
+        if (before.name, before.global_name) == (after.name, after.global_name):
+            return
+        for guild in self.guilds:
+            member = guild.get_member(after.id)
+            if member is not None:
+                await self._enforce_name(member)
+
+    async def on_member_join(self, member: discord.Member) -> None:
+        await self._enforce_name(member)
 
     # -- live capture ---------------------------------------------------------------
 

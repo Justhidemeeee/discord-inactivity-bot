@@ -39,6 +39,13 @@ class Config:
     # Members whose server nickname is cleared whenever they set one.
     nick_locked_user_ids: frozenset[int]
 
+    # Impersonation block: anyone (other than protected_user_id) whose name
+    # contains one of these terms gets their server nickname forced to
+    # impersonation_nick. Empty terms = disabled.
+    protected_user_id: int
+    impersonation_terms: tuple[str, ...]
+    impersonation_nick: str
+
     # How many days of history to keep. Older rows are periodically purged.
     retention_days: int
 
@@ -71,6 +78,10 @@ class Config:
             authorized_pruner_id=_int("AUTHORIZED_PRUNER_ID", 0),
             nick_locked_user_ids=frozenset(
                 int(x) for x in os.getenv("NICK_LOCKED_USER_IDS", "").replace(" ", "").split(",") if x),
+            protected_user_id=_int("PROTECTED_USER_ID", 0),
+            impersonation_terms=tuple(
+                t.strip() for t in os.getenv("IMPERSONATION_TERMS", "").split(",") if t.strip()),
+            impersonation_nick=(os.getenv("IMPERSONATION_NICK") or "loser").strip()[:32],
             retention_days=_int("RETENTION_DAYS", 365),
             backfill_batch_size=max(1, _int("BACKFILL_BATCH_SIZE", 500)),
             backfill_concurrency=min(10, max(1, _int("BACKFILL_CONCURRENCY", 3))),
