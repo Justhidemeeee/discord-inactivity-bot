@@ -144,7 +144,7 @@ class InactivityBot(discord.Client):
         cfg = self.config
         if member.id == cfg.protected_user_id or member.bot:
             return False, None, ""
-        forced = cfg.impersonation_nick
+        forced = cfg.impersonation_nick_overrides.get(member.id, cfg.impersonation_nick)
         if cfg.impersonation_terms:
             # The forced nickname itself doesn't count, or it would never settle.
             nick = member.nick if member.nick != forced else None

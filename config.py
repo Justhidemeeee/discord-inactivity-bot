@@ -45,6 +45,8 @@ class Config:
     protected_user_id: int
     impersonation_terms: tuple[str, ...]
     impersonation_nick: str
+    # Per-member replacement for impersonation_nick, e.g. their real name.
+    impersonation_nick_overrides: dict[int, str]
 
     # How many days of history to keep. Older rows are periodically purged.
     retention_days: int
@@ -82,6 +84,12 @@ class Config:
             impersonation_terms=tuple(
                 t.strip() for t in os.getenv("IMPERSONATION_TERMS", "").split(",") if t.strip()),
             impersonation_nick=(os.getenv("IMPERSONATION_NICK") or "loser").strip()[:32],
+            # "id=nick,id=nick"
+            impersonation_nick_overrides={
+                int(k): v.strip()[:32]
+                for k, _, v in (pair.partition("=") for pair in
+                                os.getenv("IMPERSONATION_NICK_OVERRIDES", "").split(","))
+                if k.strip().isdigit() and v.strip()},
             retention_days=_int("RETENTION_DAYS", 365),
             backfill_batch_size=max(1, _int("BACKFILL_BATCH_SIZE", 500)),
             backfill_concurrency=min(10, max(1, _int("BACKFILL_CONCURRENCY", 3))),
