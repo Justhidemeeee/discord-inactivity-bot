@@ -36,6 +36,9 @@ class Config:
     # but the kick button is only attached when this user runs it.
     authorized_pruner_id: int
 
+    # Members whose server nickname is cleared whenever they set one.
+    nick_locked_user_ids: frozenset[int]
+
     # How many days of history to keep. Older rows are periodically purged.
     retention_days: int
 
@@ -66,6 +69,8 @@ class Config:
             digest_threshold=_int("DIGEST_THRESHOLD", 0),
             digest_days=_int("DIGEST_DAYS", 0),
             authorized_pruner_id=_int("AUTHORIZED_PRUNER_ID", 0),
+            nick_locked_user_ids=frozenset(
+                int(x) for x in os.getenv("NICK_LOCKED_USER_IDS", "").replace(" ", "").split(",") if x),
             retention_days=_int("RETENTION_DAYS", 365),
             backfill_batch_size=max(1, _int("BACKFILL_BATCH_SIZE", 500)),
             backfill_concurrency=min(10, max(1, _int("BACKFILL_CONCURRENCY", 3))),

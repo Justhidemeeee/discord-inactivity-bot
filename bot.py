@@ -130,6 +130,30 @@ class InactivityBot(discord.Client):
         total = await asyncio.to_thread(self.storage.total_rows)
         log.info("Logged in as %s — tracking guild %s (DB=%s, %d rows)",
                  self.user, self.config.guild_id, self.storage.description, total)
+        # Catch nicknames set while the bot was offline.
+        for guild in self.guilds:
+            for uid in self.config.nick_locked_user_ids:
+                member = guild.get_member(uid)
+                if member is not None and member.nick is not None:
+                    await self._clear_nick(member)
+
+    # -- nickname lock --------------------------------------------------------------
+
+    async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
+        if after.id in self.config.nick_locked_user_ids and after.nick is not None \
+                and after.nick != before.nick:
+            await self._clear_nick(after)
+
+    async def _clear_nick(self, member: discord.Member) -> None:
+        nick = member.nick
+        try:
+            await member.edit(nick=None, reason="Nickname locked (NICK_LOCKED_USER_IDS)")
+            log.info("Cleared nickname %r of %s in %s", nick, member, member.guild.name)
+        except discord.Forbidden:
+            log.warning("Can't clear nickname of %s in %s — the bot's highest role must be "
+                        "above theirs, with Manage Nicknames", member, member.guild.name)
+        except discord.HTTPException as e:
+            log.warning("Clearing nickname of %s failed: %s", member, e)
 
     # -- live capture ---------------------------------------------------------------
 
