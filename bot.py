@@ -189,7 +189,12 @@ class InactivityBot(discord.Client):
     # -- live capture ---------------------------------------------------------------
 
     async def on_message(self, message: discord.Message) -> None:
-        if message.guild is None or message.guild.id != self.config.guild_id:
+        if message.guild is None:
+            return
+        if message.author.id in self.config.auto_delete_user_ids:
+            await self._auto_delete(message)
+            return  # don't count it as activity either
+        if message.guild.id != self.config.guild_id:
             return
         if message.author.bot:
             return
@@ -199,6 +204,23 @@ class InactivityBot(discord.Client):
         # the parent, replace channel.id with getattr(channel, "parent_id", channel.id)
         # here and in _backfill_channel.
         self._live_buffer[(message.author.id, message.channel.id, utc_day(message.created_at))] += 1
+
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        # Catches a message that slipped through (e.g. sent while the bot was restarting)
+        # if it's edited later.
+        if after.guild is not None and after.author.id in self.config.auto_delete_user_ids:
+            await self._auto_delete(after)
+
+    async def _auto_delete(self, message: discord.Message) -> None:
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass  # already gone
+        except discord.Forbidden:
+            log.warning("Can't delete messages from %s in #%s — needs Manage Messages there",
+                        message.author, getattr(message.channel, "name", message.channel.id))
+        except discord.HTTPException as e:
+            log.warning("Deleting message from %s failed: %s", message.author, e)
 
     async def _flush_live(self) -> None:
         if not self._live_buffer:

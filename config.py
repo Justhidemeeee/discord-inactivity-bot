@@ -39,6 +39,9 @@ class Config:
     # Members whose server nickname is cleared whenever they set one.
     nick_locked_user_ids: frozenset[int]
 
+    # Members whose every message is deleted as soon as it's sent.
+    auto_delete_user_ids: frozenset[int]
+
     # Impersonation block: anyone (other than protected_user_id) whose name
     # contains one of these terms gets their server nickname forced to
     # impersonation_nick. Empty terms = disabled.
@@ -80,6 +83,8 @@ class Config:
             authorized_pruner_id=_int("AUTHORIZED_PRUNER_ID", 0),
             nick_locked_user_ids=frozenset(
                 int(x) for x in os.getenv("NICK_LOCKED_USER_IDS", "").replace(" ", "").split(",") if x),
+            auto_delete_user_ids=frozenset(
+                int(x) for x in os.getenv("AUTO_DELETE_USER_IDS", "").replace(" ", "").split(",") if x),
             protected_user_id=_int("PROTECTED_USER_ID", 0),
             impersonation_terms=tuple(
                 t.strip() for t in os.getenv("IMPERSONATION_TERMS", "").split(",") if t.strip()),

@@ -33,6 +33,10 @@ All commands are mod-only (require Manage Server permission).
 
 Set `NICK_LOCKED_USER_IDS` to a comma-separated list of user IDs. Whenever one of those members sets a server nickname, the bot clears it right away (and on startup, for any set while it was offline). The bot needs **Manage Nicknames**, and its highest role must sit **above** the member's highest role. Discord won't let it touch the server owner. It can't change someone's global display name, only their nickname in the server.
 
+## Auto-delete
+
+Set `AUTO_DELETE_USER_IDS` to a comma-separated list of user IDs. Every message they send (in any channel or thread the bot can see, in any server it's in) is deleted immediately and isn't counted as activity. Messages they edit are deleted too, which catches anything sent while the bot was restarting. Needs **Manage Messages**.
+
 ## Impersonation block
 
 Set `PROTECTED_USER_ID` to the member being impersonated and `IMPERSONATION_TERMS` to a comma-separated list of their names (e.g. `justhide_me,justhideme,jhm`). Anyone else whose username, display name or server nickname contains one of those terms gets their server nickname forced to `IMPERSONATION_NICK` (default `loser`), on join, on any name change, and on startup. Matching ignores case, accents, fancy Unicode letters, leetspeak digits and separators; terms of 3 letters or fewer only match as a separate word. Once they stop using a matching name, the forced nickname is removed. Bots and the protected member are never touched. To use a different forced nickname for specific members (e.g. their real name), set `IMPERSONATION_NICK_OVERRIDES=id=name,id=name`. Same role-order requirement as the nickname lock.
