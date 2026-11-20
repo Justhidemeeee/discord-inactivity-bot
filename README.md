@@ -29,6 +29,17 @@ All commands are mod-only (require Manage Server permission).
 - **`/vcstatus [text]`** (anyone with Set Voice Channel Status)
   Sets the status of the voice channel you're currently in. Leave `text` empty to clear it. You need **Set Voice Channel Status** in that channel, the same as setting it yourself; the bot needs **Set Voice Channel Status** and **Manage Channels**. 5-second cooldown per user.
 
+## Restriction commands
+
+Only the server owner and the user in `AUTHORIZED_PRUNER_ID` can use these, even if others have Manage Server, so a restricted member can't lift their own restrictions. Nobody can restrict themselves, the server owner, bots, `PROTECTED_USER_ID`, or anyone whose highest role is at or above theirs. Rules are saved in the database, survive restarts, and can expire on their own.
+
+- **`/autodelete user [enabled] [minutes]`** — delete every message the member sends; `enabled:false` stops it; `minutes` makes it stop automatically.
+- **`/nicklock user [nickname] [minutes]`** — force a nickname, or leave `nickname` empty to block nicknames entirely. A forced nickname here overrides the impersonation block.
+- **`/nickunlock user [clear]`** — remove the lock; `clear:true` also removes their current nickname.
+- **`/restrictions`** — list everything active, with who set it and when it ends.
+
+The `AUTO_DELETE_USER_IDS` and `NICK_LOCKED_USER_IDS` settings below still work as permanent rules that the commands can't lift.
+
 ## Nickname lock
 
 Set `NICK_LOCKED_USER_IDS` to a comma-separated list of user IDs. Whenever one of those members sets a server nickname, the bot clears it right away (and on startup, for any set while it was offline). The bot needs **Manage Nicknames**, and its highest role must sit **above** the member's highest role. Discord won't let it touch the server owner. It can't change someone's global display name, only their nickname in the server.

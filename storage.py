@@ -67,6 +67,16 @@ _SCHEMA = """
         key   TEXT PRIMARY KEY,
         value TEXT
     );
+
+    -- Per-member moderation rules set by slash commands (/autodelete, /nicklock).
+    CREATE TABLE IF NOT EXISTS user_rules (
+        user_id     {big} NOT NULL,
+        rule        TEXT NOT NULL,      -- 'autodelete' | 'nicklock'
+        value       TEXT,               -- nicklock: forced nickname, NULL = no nickname
+        expires_at  TEXT,               -- iso_utc(), NULL = until removed
+        set_by      {big},
+        PRIMARY KEY (user_id, rule)
+    );
 """
 
 
@@ -287,6 +297,26 @@ class Storage:
                 INSERT INTO meta (key, value) VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """, (key, value))
+
+    def set_rule(self, user_id: int, rule: str, value: Optional[str],
+                 expires_at: Optional[str], set_by: int) -> None:
+        with self._locked() as cur:
+            cur.execute("""
+                INSERT INTO user_rules (user_id, rule, value, expires_at, set_by) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, rule) DO UPDATE SET
+                    value = excluded.value, expires_at = excluded.expires_at, set_by = excluded.set_by
+            """, (user_id, rule, value, expires_at, set_by))
+
+    def delete_rule(self, user_id: int, rule: str) -> bool:
+        with self._locked() as cur:
+            cur.execute("DELETE FROM user_rules WHERE user_id = ? AND rule = ?", (user_id, rule))
+            return cur.rowcount > 0
+
+    def all_rules(self) -> list[tuple[int, str, Optional[str], Optional[str], Optional[int]]]:
+        """[(user_id, rule, value, expires_at, set_by)]"""
+        with self._locked() as cur:
+            cur.execute("SELECT user_id, rule, value, expires_at, set_by FROM user_rules")
+            return [tuple(r) for r in cur.fetchall()]
 
     def meta_setdefault(self, key: str, value: str) -> str:
         """Set key only if absent; return the stored value either way."""

@@ -99,6 +99,8 @@ class InactivityBot(discord.Client):
         # this, so it never re-counts messages on_message already counted.
         self._live_since = parse_iso_utc(self.storage.meta_setdefault(
             "live_since", iso_utc(dt.datetime.now(dt.timezone.utc))))
+        # (user_id, rule) -> (value, expires_at or None, set_by). Mirrors the user_rules table.
+        self._rules: dict[tuple[int, str], tuple[Optional[str], Optional[dt.datetime], Optional[int]]] = {}
         self._register_commands()
 
     # -- lifecycle ------------------------------------------------------------------
@@ -107,7 +109,10 @@ class InactivityBot(discord.Client):
         guild = discord.Object(id=self.config.guild_id)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
+        for uid, rule, value, expires, set_by in await asyncio.to_thread(self.storage.all_rules):
+            self._rules[(uid, rule)] = (value, parse_iso_utc(expires) if expires else None, set_by)
         self.live_flush.start()
+        self.rule_expiry.start()
         self.nightly_maintenance.start()
         if self.config.digest_channel_id:
             self.monthly_digest.start()
@@ -132,10 +137,76 @@ class InactivityBot(discord.Client):
         log.info("Logged in as %s — tracking guild %s (DB=%s, %d rows)",
                  self.user, self.config.guild_id, self.storage.description, total)
         # Catch names changed while the bot was offline.
-        if self.config.nick_locked_user_ids or self.config.impersonation_terms:
+        if self.config.nick_locked_user_ids or self.config.impersonation_terms or self._rules:
             for guild in self.guilds:
                 for member in list(guild.members):
                     await self._enforce_name(member)
+
+    # -- per-member rules (/autodelete, /nicklock) -----------------------------------
+
+    def _rule(self, user_id: int, rule: str):
+        """Return (value, expires_at, set_by) if the rule is active, else None."""
+        r = self._rules.get((user_id, rule))
+        if r is None or (r[1] is not None and r[1] <= dt.datetime.now(dt.timezone.utc)):
+            return None
+        return r
+
+    def _auto_delete_active(self, user_id: int) -> bool:
+        return user_id in self.config.auto_delete_user_ids or self._rule(user_id, "autodelete") is not None
+
+    def _nick_lock(self, user_id: int) -> tuple[bool, Optional[str]]:
+        """(locked, forced nickname or None)."""
+        r = self._rule(user_id, "nicklock")
+        if r is not None:
+            return True, r[0]
+        return user_id in self.config.nick_locked_user_ids, None
+
+    async def _set_rule(self, user_id: int, rule: str, value: Optional[str],
+                        minutes: Optional[int], set_by: int) -> Optional[dt.datetime]:
+        expires = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)) if minutes else None
+        await asyncio.to_thread(self.storage.set_rule, user_id, rule, value,
+                                iso_utc(expires) if expires else None, set_by)
+        self._rules[(user_id, rule)] = (value, expires, set_by)
+        return expires
+
+    async def _drop_rule(self, user_id: int, rule: str) -> bool:
+        self._rules.pop((user_id, rule), None)
+        return await asyncio.to_thread(self.storage.delete_rule, user_id, rule)
+
+    @tasks.loop(seconds=15)
+    async def rule_expiry(self):
+        now = dt.datetime.now(dt.timezone.utc)
+        for (uid, rule), (_, expires, _) in list(self._rules.items()):
+            if expires is not None and expires <= now:
+                await self._drop_rule(uid, rule)
+                log.info("Rule %s for user %s expired", rule, uid)
+
+    def _moderation_block_reason(self, interaction: discord.Interaction,
+                                 target: discord.Member) -> Optional[str]:
+        """Why the invoker may not add or remove a restriction on `target`, or None if they may."""
+        invoker = interaction.user
+        guild = interaction.guild
+        # Manage Server alone isn't enough: anyone holding it could lift their own restrictions.
+        if invoker.id not in (self.config.authorized_pruner_id, guild.owner_id):
+            return "Only the server owner and the bot's authorized pruner can use this."
+        if target.bot:
+            return "Bots can't be restricted."
+        if target.id == invoker.id:
+            return "You can't change your own restrictions."
+        if target.id == guild.owner_id:
+            return "The server owner can't be restricted."
+        if target.id == self.config.protected_user_id:
+            return f"{target.mention} is protected."
+        # Same rule Discord uses for moderation: you can only act on people below you.
+        if invoker.id != guild.owner_id and isinstance(invoker, discord.Member) \
+                and target.top_role >= invoker.top_role:
+            return f"{target.mention}'s highest role is the same as or above yours."
+        return None
+
+    @staticmethod
+    def _until_text(expires: Optional[dt.datetime]) -> str:
+        return f"until <t:{int(expires.timestamp())}:f> (<t:{int(expires.timestamp())}:R>)" if expires \
+            else "until you turn it off"
 
     # -- name rules: nickname lock + impersonation block -----------------------------
 
@@ -144,14 +215,18 @@ class InactivityBot(discord.Client):
         cfg = self.config
         if member.id == cfg.protected_user_id or member.bot:
             return False, None, ""
+        locked, lock_nick = self._nick_lock(member.id)
+        # An explicit /nicklock nickname beats every other rule.
+        if locked and lock_nick is not None:
+            return True, lock_nick, "Nickname locked (/nicklock)"
         forced = cfg.impersonation_nick_overrides.get(member.id, cfg.impersonation_nick)
         if cfg.impersonation_terms:
             # The forced nickname itself doesn't count, or it would never settle.
             nick = member.nick if member.nick != forced else None
             if namecheck.impersonates((member.name, member.global_name, nick), cfg.impersonation_terms):
                 return True, forced, "Impersonation block (IMPERSONATION_TERMS)"
-        if member.id in cfg.nick_locked_user_ids:
-            return True, None, "Nickname locked (NICK_LOCKED_USER_IDS)"
+        if locked:
+            return True, None, "Nickname locked"
         if cfg.impersonation_terms and member.nick == forced:
             return True, None, "No longer impersonating"
         return False, None, ""
@@ -191,7 +266,7 @@ class InactivityBot(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if message.guild is None:
             return
-        if message.author.id in self.config.auto_delete_user_ids:
+        if self._auto_delete_active(message.author.id):
             await self._auto_delete(message)
             return  # don't count it as activity either
         if message.guild.id != self.config.guild_id:
@@ -208,7 +283,7 @@ class InactivityBot(discord.Client):
     async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
         # Catches a message that slipped through (e.g. sent while the bot was restarting)
         # if it's edited later.
-        if after.guild is not None and after.author.id in self.config.auto_delete_user_ids:
+        if after.guild is not None and self._auto_delete_active(after.author.id):
             await self._auto_delete(after)
 
     async def _auto_delete(self, message: discord.Message) -> None:
@@ -499,6 +574,126 @@ class InactivityBot(discord.Client):
                     embed.set_footer(text=f"Showing {len(shown)} of {len(recent)} — full list attached.")
             await interaction.followup.send(embed=embed, files=files, ephemeral=True,
                                             allowed_mentions=discord.AllowedMentions.none())
+
+        @self.tree.command(name="autodelete",
+                           description="Delete every message a member sends (or stop doing so).")
+        @app_commands.describe(user="The member.",
+                               enabled="true = start deleting (default), false = stop.",
+                               minutes="Stop automatically after this many minutes (default: never).")
+        @app_commands.default_permissions(manage_guild=True)
+        @app_commands.guild_only()
+        async def autodelete_cmd(interaction: discord.Interaction, user: discord.Member,
+                                 enabled: bool = True,
+                                 minutes: Optional[app_commands.Range[int, 1, 40320]] = None):
+            blocked = self._moderation_block_reason(interaction, user)
+            if blocked:
+                await interaction.response.send_message(f"❌ {blocked}", ephemeral=True,
+                                                        allowed_mentions=discord.AllowedMentions.none())
+                return
+            if not enabled:
+                removed = await self._drop_rule(user.id, "autodelete")
+                note = ""
+                if user.id in self.config.auto_delete_user_ids:
+                    note = "\n⚠️ They're also listed in `AUTO_DELETE_USER_IDS` on Heroku, which still applies."
+                await interaction.response.send_message(
+                    (f"✅ Stopped deleting messages from {user.mention}." if removed
+                     else f"{user.mention} wasn't on auto-delete.") + note,
+                    ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+                return
+            expires = await self._set_rule(user.id, "autodelete", None, minutes, interaction.user.id)
+            log.info("%s enabled autodelete for %s %s", interaction.user, user, expires or "indefinitely")
+            await interaction.response.send_message(
+                f"🗑️ Deleting every message from {user.mention} {self._until_text(expires)}.",
+                ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+        @self.tree.command(name="nicklock",
+                           description="Lock a member's nickname: force one, or block nicknames entirely.")
+        @app_commands.describe(user="The member.",
+                               nickname="Nickname to force (leave empty to block nicknames).",
+                               minutes="Unlock automatically after this many minutes (default: never).")
+        @app_commands.default_permissions(manage_guild=True)
+        @app_commands.guild_only()
+        async def nicklock_cmd(interaction: discord.Interaction, user: discord.Member,
+                               nickname: Optional[app_commands.Range[str, 1, 32]] = None,
+                               minutes: Optional[app_commands.Range[int, 1, 40320]] = None):
+            blocked = self._moderation_block_reason(interaction, user)
+            if blocked:
+                await interaction.response.send_message(f"❌ {blocked}", ephemeral=True,
+                                                        allowed_mentions=discord.AllowedMentions.none())
+                return
+            me = interaction.guild.me
+            if user.top_role >= me.top_role or not me.guild_permissions.manage_nicknames:
+                await interaction.response.send_message(
+                    f"❌ I can't change {user.mention}'s nickname — move my role above theirs "
+                    f"in Server Settings → Roles (and give me Manage Nicknames).",
+                    ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+                return
+            expires = await self._set_rule(user.id, "nicklock", nickname, minutes, interaction.user.id)
+            what = f"locked to **{discord.utils.escape_markdown(nickname)}**" if nickname else "blocked (no nickname)"
+            await interaction.response.send_message(
+                f"🔒 {user.mention}'s nickname is {what} {self._until_text(expires)}.",
+                ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+            await self._enforce_name(user)
+
+        @self.tree.command(name="nickunlock", description="Remove a member's nickname lock.")
+        @app_commands.describe(user="The member.",
+                               clear="Also remove the nickname they have now (default: no).")
+        @app_commands.default_permissions(manage_guild=True)
+        @app_commands.guild_only()
+        async def nickunlock_cmd(interaction: discord.Interaction, user: discord.Member, clear: bool = False):
+            blocked = self._moderation_block_reason(interaction, user)
+            if blocked:
+                await interaction.response.send_message(f"❌ {blocked}", ephemeral=True,
+                                                        allowed_mentions=discord.AllowedMentions.none())
+                return
+            await interaction.response.defer(ephemeral=True)
+            removed = await self._drop_rule(user.id, "nicklock")
+            if clear and user.nick is not None:
+                try:
+                    await user.edit(nick=None, reason=f"/nickunlock by {interaction.user}")
+                except discord.HTTPException:
+                    pass
+            await self._enforce_name(user)  # other rules (e.g. impersonation) still apply
+            notes = []
+            if user.id in self.config.nick_locked_user_ids:
+                notes.append("they're also listed in `NICK_LOCKED_USER_IDS` on Heroku, which still applies")
+            if self.config.impersonation_terms and namecheck.impersonates(
+                    (user.name, user.global_name), self.config.impersonation_terms):
+                notes.append("the impersonation block still applies while their name copies the protected member")
+            msg = f"🔓 Unlocked {user.mention}'s nickname." if removed else f"{user.mention} had no /nicklock."
+            if notes:
+                msg += "\n⚠️ Note: " + "; ".join(notes) + "."
+            await interaction.followup.send(msg, ephemeral=True,
+                                            allowed_mentions=discord.AllowedMentions.none())
+
+        @self.tree.command(name="restrictions", description="List active /autodelete and /nicklock rules.")
+        @app_commands.default_permissions(manage_guild=True)
+        @app_commands.guild_only()
+        async def restrictions_cmd(interaction: discord.Interaction):
+            if interaction.user.id not in (self.config.authorized_pruner_id, interaction.guild.owner_id):
+                await interaction.response.send_message(
+                    "❌ Only the server owner and the bot's authorized pruner can use this.", ephemeral=True)
+                return
+            lines = []
+            for (uid, rule), (value, expires, set_by) in sorted(self._rules.items()):
+                if self._rule(uid, rule) is None:
+                    continue
+                what = ("🗑️ auto-delete" if rule == "autodelete" else
+                        f"🔒 nickname locked to **{discord.utils.escape_markdown(value)}**" if value else
+                        "🔒 nickname blocked")
+                by = f" · set by <@{set_by}>" if set_by else ""
+                lines.append(f"• <@{uid}> — {what} {self._until_text(expires)}{by}")
+            cfg = self.config
+            for uid in sorted(cfg.auto_delete_user_ids):
+                lines.append(f"• <@{uid}> — 🗑️ auto-delete (Heroku setting, permanent)")
+            for uid in sorted(cfg.nick_locked_user_ids):
+                lines.append(f"• <@{uid}> — 🔒 nickname blocked (Heroku setting, permanent)")
+            if cfg.impersonation_terms:
+                lines.append(f"\n🛡️ Impersonation block on for <@{cfg.protected_user_id}> "
+                             f"(forced nickname: **{discord.utils.escape_markdown(cfg.impersonation_nick)}**)")
+            await interaction.response.send_message(
+                "**Active restrictions**\n" + ("\n".join(lines) if lines else "_None._"),
+                ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
         @self.tree.command(name="activity",
                            description="Show recent activity for one member.")
